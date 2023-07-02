@@ -177,7 +177,7 @@ class Forwarder(object):
         """Wait until forwarding is done."""
         self.thread.join()
 
-    def close(self):
+    def stop(self):
         """Set stop flag.
 
         Does not join thread because it could be stuck on a read.
