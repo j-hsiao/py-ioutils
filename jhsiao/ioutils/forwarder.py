@@ -27,8 +27,11 @@ class Wrapper(object):
         orig: file like object
             The original stream.
         wrapped: bool
-            If wrapped, stream.detach() will be called in detach() and
-            close().  Otherwise, do nothing.
+            If wrapped, then stream is a wrapped version of orig.
+            calling detach() will detach `stream` from orig.
+            Otherwise, detach() will just return orig.  In either case
+            close() will close the orig stream and detach `stream` if
+            applicable.
         """
         self.stream = stream
         self.orig = orig
@@ -36,6 +39,9 @@ class Wrapper(object):
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
+
+    def __iter__(self):
+        return iter(self.stream)
 
     def detach(self):
         """Detach stream if applicable.  Return the original stream."""
@@ -94,7 +100,7 @@ class Forwarder(object):
     """
     def __init__(
         self, istream, ostream, iclose=True, oclose=True,
-        flush=False, blocksize=io.DEFAULT_BUFFER_SIZE):
+        flush=False, blocksize=0):
         """Initialize a forwarder.
 
         istream: file-like object.
@@ -103,6 +109,9 @@ class Forwarder(object):
             Binary output stream.
         blocksize: int
             Size of blocks to transfer between the two streams.
+            <=0 uses defaults:
+                binary = io.DEFAULT_BUFFER_SIZE chunks
+                text: by line
         flush: bool
             Flush after each write?
         iclose: bool
@@ -131,14 +140,19 @@ class Forwarder(object):
             try:
                 readinto = getattr(istream, 'readinto1', istream.readinto)
             except AttributeError:
-                self._forward_text(istream.read, ostream.write, flush)
+                self._forward_text(istream, ostream.write, flush)
             else:
                 self._forward_binary(readinto, ostream.write, flush)
         except Exception:
-            pass
+            self._end(istream, ostream)
+            raise
+        self._end(istream, ostream)
+
+    def _end(self, istream, ostream):
+        """End forwarding and close/detach streams as appropriate."""
         try:
             ostream.flush()
-        except AttributeError:
+        except (AttributeError, IOError, OSError):
             pass
         if self.iclose:
             istream.close()
@@ -150,7 +164,11 @@ class Forwarder(object):
             ostream.detach()
 
     def _forward_binary(self, read, write, flush):
-        buf = bytearray(self.blocksize)
+        """Forward binary stream using readinto."""
+        if self.blocksize > 0:
+            buf = bytearray(self.blocksize)
+        else:
+            buf = bytearray(io.DEFAULT_BUFFER_SIZE)
         view = memoryview(buf)
         amt = read(view)
         running = self.running.is_set
@@ -160,15 +178,26 @@ class Forwarder(object):
                 flush()
             amt = read(view)
 
-    def _forward_text(self, read, write, flush):
-        size = self.blocksize
-        data = read(size)
+    def _forward_text(self, istream, write, flush):
+        """Forward text stream."""
         running = self.running.is_set
-        while data and running():
-            write(data)
-            if flush is not None:
-                flush()
+        if self.blocksize > 0:
+            read = istream.read
+            size = self.blocksize
             data = read(size)
+            while data and running():
+                write(data)
+                if flush is not None:
+                    flush()
+                data = read(size)
+        else:
+            for line in istream:
+                write(line)
+                if flush is not None:
+                    flush()
+                if not running():
+                    return
+
 
     def is_alive(self):
         return self.thread.is_alive()
