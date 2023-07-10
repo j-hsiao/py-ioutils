@@ -5,7 +5,7 @@ could be multiple bytes.  As a result, accessing the underlying
 binary stream will lose the buffered data.
 """
 from __future__ import print_function
-__all__ = ['Forwarder']
+__all__ = ['Forwarder', 'Wrapper']
 
 import io
 import threading
@@ -111,7 +111,7 @@ class Forwarder(object):
             Size of blocks to transfer between the two streams.
             <=0 uses defaults:
                 binary = io.DEFAULT_BUFFER_SIZE chunks
-                text: by line
+                text: by line (detected by lack of readinto)
         flush: bool
             Flush after each write?
         iclose: bool
@@ -138,11 +138,24 @@ class Forwarder(object):
             flush = None
         try:
             try:
-                readinto = getattr(istream, 'readinto1', istream.readinto)
+                getattr(istream, 'readinto1', istream.readinto)
             except AttributeError:
-                self._forward_text(istream, ostream.write, flush)
+                if self.blocksize > 0:
+                    self._forward_read(
+                        getattr(istream, 'read1', istream.read),
+                        ostream.write, flush)
+                else:
+                    self._forward_lines(istream, ostream.write, flush)
             else:
-                self._forward_binary(readinto, ostream.write, flush)
+                # for binary, prefer 1-time calls for forwarding
+                for method, ffunc in (
+                        ('readinto1', self._forward_readinto),
+                        ('read1', self._forward_read),
+                        ('readinto', self._forward_readinto)):
+                    func = getattr(istream, method, None)
+                    if func is not None:
+                        ffunc(func, ostream.write, flush)
+                        break
         except Exception:
             self._end(istream, ostream)
             raise
@@ -163,41 +176,48 @@ class Forwarder(object):
         else:
             ostream.detach()
 
-    def _forward_binary(self, read, write, flush):
+    def _forward_readinto(self, readinto, write, flush):
         """Forward binary stream using readinto."""
         if self.blocksize > 0:
             buf = bytearray(self.blocksize)
         else:
             buf = bytearray(io.DEFAULT_BUFFER_SIZE)
         view = memoryview(buf)
-        amt = read(view)
         running = self.running.is_set
-        while amt and running():
-            write(view[:amt])
-            if flush is not None:
-                flush()
-            amt = read(view)
+        while running():
+            amt = readinto(view)
+            if amt:
+                write(view[:amt])
+                if flush is not None:
+                    flush()
+            else:
+                return
 
-    def _forward_text(self, istream, write, flush):
-        """Forward text stream."""
-        running = self.running.is_set
+    def _forward_read(self, read, write, flush):
+        """Some fobjs have a read1 but not readinto1 or no readinto."""
         if self.blocksize > 0:
-            read = istream.read
             size = self.blocksize
+        else:
+            size = io.DEFAULT_BUFFER_SIZE
+        running = self.running.is_set
+        while running():
             data = read(size)
-            while data and running():
+            if data:
                 write(data)
                 if flush is not None:
                     flush()
-                data = read(size)
-        else:
-            for line in istream:
-                write(line)
-                if flush is not None:
-                    flush()
-                if not running():
-                    return
+            else:
+                return
 
+    def _forward_lines(self, istream, write, flush):
+        """Forward lines."""
+        running = self.running.is_set
+        for line in istream:
+            write(line)
+            if flush is not None:
+                flush()
+            if not running():
+                return
 
     def is_alive(self):
         return self.thread.is_alive()
