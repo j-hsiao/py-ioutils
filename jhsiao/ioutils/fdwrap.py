@@ -30,13 +30,13 @@ class FDWrap(io.RawIOBase):
         self._orig = fobj
         r, w = os.pipe()
         if 'r' in mode:
-            self.file = os.fdopen(r, mode)
+            self.file = io.open(r, mode)
             self._forward = Forwarder(
-                fobj, os.fdopen(w, 'wb'), False, True)
+                fobj, io.open(w, 'wb'), False, True)
         else:
-            self.file = os.fdopen(w, mode)
+            self.file = io.open(w, mode)
             self._forward = Forwarder(
-                os.fdopen(r, 'rb'), fobj, True, False)
+                io.open(r, 'rb'), fobj, True, False)
 
     def __enter__(self):
         return self
@@ -79,8 +79,13 @@ if __name__ == '__main__':
     import subprocess as sp
     import sys
     import io
-    commands = io.StringIO(
-        'import sys\nprint(sys.version_info)\nexit()\n')
+    if sys.version_info.major > 2:
+        commands = io.StringIO(
+            'import sys\nprint(sys.version_info)\nexit()\n')
+    else:
+        commands = io.StringIO(
+            u'import sys\nprint(sys.version_info)\nexit()\n')
+
     with FDWrap(commands, 'rb') as wrap:
         p = sp.Popen(
             [sys.executable], stdin=wrap, stdout=sp.PIPE, stderr=sp.PIPE)

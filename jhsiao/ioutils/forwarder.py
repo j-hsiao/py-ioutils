@@ -247,6 +247,8 @@ if __name__ == '__main__':
     import os
     message = '\n'.join(
         ('hello world!', 'goodbye world!', 'whatever')*io.DEFAULT_BUFFER_SIZE)
+    if sys.version_info.major < 3:
+        message = message.decode()
 
     check = io.TextIOWrapper(io.BytesIO())
     check.write(message)
@@ -260,12 +262,12 @@ if __name__ == '__main__':
     rt3, wt3 = os.pipe()
     dst = io.BytesIO()
 
-    inp = os.fdopen(wt0, 'w')
+    inp = io.open(wt0, 'w')
     pairs = [
-        (os.fdopen(rb0, 'rb'), os.fdopen(wb1, 'wb')), # binary to binary
-        (os.fdopen(rt1, 'r'), os.fdopen(wt2, 'w')), # text to text
-        (os.fdopen(rb2, 'rb'), os.fdopen(wt3, 'w')), # binary to text
-        (os.fdopen(rt3, 'r'), dst), # text to binary
+        (io.open(rb0, 'rb'), io.open(wb1, 'wb')), # binary to binary
+        (io.open(rt1, 'r'), io.open(wt2, 'w')), # text to text
+        (io.open(rb2, 'rb'), io.open(wt3, 'w')), # binary to text
+        (io.open(rt3, 'r'), dst), # text to binary
     ]
     forwarders = [Forwarder(i, o, oclose=o is not dst) for i, o in pairs]
 
