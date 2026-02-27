@@ -5,7 +5,7 @@ could be multiple bytes.  As a result, accessing the underlying
 binary stream will lose the buffered data.
 """
 from __future__ import print_function
-__all__ = ['Forwarder']
+__all__ = ['Forwarder', 'Wrapper']
 
 import io
 import threading
@@ -27,8 +27,11 @@ class Wrapper(object):
         orig: file like object
             The original stream.
         wrapped: bool
-            If wrapped, stream.detach() will be called in detach() and
-            close().  Otherwise, do nothing.
+            If wrapped, then stream is a wrapped version of orig.
+            calling detach() will detach `stream` from orig.
+            Otherwise, detach() will just return orig.  In either case
+            close() will close the orig stream and detach `stream` if
+            applicable.
         """
         self.stream = stream
         self.orig = orig
@@ -36,6 +39,9 @@ class Wrapper(object):
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
+
+    def __iter__(self):
+        return iter(self.stream)
 
     def detach(self):
         """Detach stream if applicable.  Return the original stream."""
@@ -94,7 +100,7 @@ class Forwarder(object):
     """
     def __init__(
         self, istream, ostream, iclose=True, oclose=True,
-        flush=False, blocksize=io.DEFAULT_BUFFER_SIZE):
+        flush=False, blocksize=0):
         """Initialize a forwarder.
 
         istream: file-like object.
@@ -103,6 +109,9 @@ class Forwarder(object):
             Binary output stream.
         blocksize: int
             Size of blocks to transfer between the two streams.
+            <=0 uses defaults:
+                binary = io.DEFAULT_BUFFER_SIZE chunks
+                text: by line (detected by lack of readinto)
         flush: bool
             Flush after each write?
         iclose: bool
@@ -129,16 +138,34 @@ class Forwarder(object):
             flush = None
         try:
             try:
-                readinto = getattr(istream, 'readinto1', istream.readinto)
+                getattr(istream, 'readinto1', istream.readinto)
             except AttributeError:
-                self._forward_text(istream.read, ostream.write, flush)
+                if self.blocksize > 0:
+                    self._forward_read(
+                        getattr(istream, 'read1', istream.read),
+                        ostream.write, flush)
+                else:
+                    self._forward_lines(istream, ostream.write, flush)
             else:
-                self._forward_binary(readinto, ostream.write, flush)
+                # for binary, prefer 1-time calls for forwarding
+                for method, ffunc in (
+                        ('readinto1', self._forward_readinto),
+                        ('read1', self._forward_read),
+                        ('readinto', self._forward_readinto)):
+                    func = getattr(istream, method, None)
+                    if func is not None:
+                        ffunc(func, ostream.write, flush)
+                        break
         except Exception:
-            pass
+            self._end(istream, ostream)
+            raise
+        self._end(istream, ostream)
+
+    def _end(self, istream, ostream):
+        """End forwarding and close/detach streams as appropriate."""
         try:
             ostream.flush()
-        except AttributeError:
+        except (AttributeError, IOError, OSError):
             pass
         if self.iclose:
             istream.close()
@@ -149,26 +176,48 @@ class Forwarder(object):
         else:
             ostream.detach()
 
-    def _forward_binary(self, read, write, flush):
-        buf = bytearray(self.blocksize)
+    def _forward_readinto(self, readinto, write, flush):
+        """Forward binary stream using readinto."""
+        if self.blocksize > 0:
+            buf = bytearray(self.blocksize)
+        else:
+            buf = bytearray(io.DEFAULT_BUFFER_SIZE)
         view = memoryview(buf)
-        amt = read(view)
         running = self.running.is_set
-        while amt and running():
-            write(view[:amt])
-            if flush is not None:
-                flush()
-            amt = read(view)
+        while running():
+            amt = readinto(view)
+            if amt:
+                write(view[:amt])
+                if flush is not None:
+                    flush()
+            else:
+                return
 
-    def _forward_text(self, read, write, flush):
-        size = self.blocksize
-        data = read(size)
+    def _forward_read(self, read, write, flush):
+        """Some fobjs have a read1 but not readinto1 or no readinto."""
+        if self.blocksize > 0:
+            size = self.blocksize
+        else:
+            size = io.DEFAULT_BUFFER_SIZE
         running = self.running.is_set
-        while data and running():
-            write(data)
+        while running():
+            data = read(size)
+            if data:
+                write(data)
+                if flush is not None:
+                    flush()
+            else:
+                return
+
+    def _forward_lines(self, istream, write, flush):
+        """Forward lines."""
+        running = self.running.is_set
+        for line in istream:
+            write(line)
             if flush is not None:
                 flush()
-            data = read(size)
+            if not running():
+                return
 
     def is_alive(self):
         return self.thread.is_alive()
@@ -177,7 +226,7 @@ class Forwarder(object):
         """Wait until forwarding is done."""
         self.thread.join()
 
-    def close(self):
+    def stop(self):
         """Set stop flag.
 
         Does not join thread because it could be stuck on a read.
@@ -218,6 +267,8 @@ if __name__ == '__main__':
     import os
     message = '\n'.join(
         ('hello world!', 'goodbye world!', 'whatever')*io.DEFAULT_BUFFER_SIZE)
+    if sys.version_info.major < 3:
+        message = message.decode()
 
     check = io.TextIOWrapper(io.BytesIO())
     check.write(message)
@@ -231,12 +282,12 @@ if __name__ == '__main__':
     rt3, wt3 = os.pipe()
     dst = io.BytesIO()
 
-    inp = os.fdopen(wt0, 'w')
+    inp = io.open(wt0, 'w')
     pairs = [
-        (os.fdopen(rb0, 'rb'), os.fdopen(wb1, 'wb')), # binary to binary
-        (os.fdopen(rt1, 'r'), os.fdopen(wt2, 'w')), # text to text
-        (os.fdopen(rb2, 'rb'), os.fdopen(wt3, 'w')), # binary to text
-        (os.fdopen(rt3, 'r'), dst), # text to binary
+        (io.open(rb0, 'rb'), io.open(wb1, 'wb')), # binary to binary
+        (io.open(rt1, 'r'), io.open(wt2, 'w')), # text to text
+        (io.open(rb2, 'rb'), io.open(wt3, 'w')), # binary to text
+        (io.open(rt3, 'r'), dst), # text to binary
     ]
     forwarders = [Forwarder(i, o, oclose=o is not dst) for i, o in pairs]
 
